@@ -94,7 +94,9 @@ it("sends cards directly to ordinary chats and DMs", async () => {
 });
 
 // The local HTTP server speaks OpenCode's session, async prompt and SSE protocols.
-// Set TOPIC_TEST_OPENCODE_PORT to exercise an actual isolated server with an echo model.
+// An external test model should stream "checking-" + prompt as a reasoning summary,
+// pause for a card refresh, then echo the prompt as visible text before finishing.
+// Point TOPIC_TEST_OPENCODE_PORT at its isolated OpenCode server.
 it("streams simultaneous topics to their own reply card before each run completes", { timeout: 25_000 }, async () => {
   const streams = new Set<ServerResponse>();
   const emit = (type: string, properties: object) => {
@@ -121,13 +123,20 @@ it("streams simultaneous topics to their own reply card before each run complete
     const text = JSON.parse(body).parts[0].text;
     emit("session.status", { sessionID: sid, status: { type: "busy" } });
     emit("message.updated", { info: { sessionID: sid, id: sid + "_msg", role: "assistant" } });
+    const reasoning = { sessionID: sid, messageID: sid + "_msg", id: sid + "_summary", type: "reasoning", text: "" };
+    const summary = "checking-" + text;
+    emit("message.part.updated", { part: reasoning });
+    emit("message.part.delta", { sessionID: sid, messageID: reasoning.messageID, partID: reasoning.id, field: "text", delta: summary });
     const part = { sessionID: sid, messageID: sid + "_msg", id: sid + "_part", type: "text", text: "" };
-    emit("message.part.updated", { part });
-    emit("message.part.delta", { sessionID: sid, messageID: part.messageID, partID: part.id, field: "text", delta: text });
+    setTimeout(() => {
+      emit("message.part.updated", { part: { ...reasoning, text: summary } });
+      emit("message.part.updated", { part });
+      emit("message.part.delta", { sessionID: sid, messageID: part.messageID, partID: part.id, field: "text", delta: text });
+    }, 1800);
     setTimeout(() => {
       emit("message.part.updated", { part: { ...part, text } });
       emit("session.status", { sessionID: sid, status: { type: "idle" } });
-    }, 1800);
+    }, 3500);
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -141,19 +150,30 @@ it("streams simultaneous topics to their own reply card before each run complete
     const root = args[args.indexOf("--message-id") + 1]!;
     assert.deepEqual(args.slice(0, 4), ["im", "+messages-reply", "--message-id", root]);
     assert.ok(roots.includes(root) && args.includes("--reply-in-thread") && args.includes("interactive"));
+    const initial = JSON.parse(args[args.indexOf("--content") + 1]!);
+    assert.equal(initial.config.update_multi, true);
+    assert.equal(initial.config.streaming_mode, undefined);
     assert.ok(!created.has(root));
     created.add(root);
     return JSON.stringify({ data: { message_id: "card_" + root } });
   };
   bridge["consumer"] = {
     isTopicGroup: async () => false,
-    channel: { updateCard: async (id: string, card: { config: { streaming_mode: boolean } }) => {
+    channel: { rawClient: { im: { v1: { message: { patch: async (request: {
+      path: { message_id: string }; data: { content: string };
+    }) => {
+      const id = request.path.message_id;
+      const body = request.data.content;
+      const card = JSON.parse(body);
+      assert.equal(card.config.update_multi, true);
+      assert.equal(card.config.streaming_mode, undefined);
       const root = id.slice("card_".length);
       assert.equal(id, "card_" + root);
       const list = updates.get(root) ?? [];
       updates.set(root, list);
-      list.push({ active: card.config.streaming_mode, body: JSON.stringify(card) });
-    } },
+      list.push({ active: card.body.elements.some((e: { tag: string }) => e.tag === "button"), body });
+      return { code: 0 };
+    } } } } } },
   } as unknown as LarkWsConsumer;
   try {
     await Promise.all(roots.map(root => bridge["handleInbound"](incoming(root, {
@@ -164,9 +184,12 @@ it("streams simultaneous topics to their own reply card before each run complete
     assert.equal(new Set(sessions.values()).size, 2);
     for (const root of roots) {
       const list = updates.get(root)!;
-      assert.ok(list.some(u => u.active && u.body.includes(marker(root))), JSON.stringify(list));
+      const summary = "checking-" + marker(root);
+      const answer = JSON.stringify(marker(root));
+      assert.ok(list.some(u => u.active && u.body.includes(summary) && !u.body.includes(answer)), JSON.stringify(list));
+      assert.ok(list.some(u => u.active && u.body.includes(answer)), JSON.stringify(list));
       assert.ok(!list.at(-1)!.active && list.at(-1)!.body.includes(marker(root)));
-      assert.equal(list.at(-1)!.body.split(marker(root)).length, 2);
+      assert.equal(list.at(-1)!.body.split(summary).length, 2);
       assert.ok(list.every(u => !u.body.includes(marker(roots.find(other => other !== root)!))));
     }
   } finally {

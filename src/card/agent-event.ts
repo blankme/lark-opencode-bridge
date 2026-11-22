@@ -18,7 +18,8 @@ export type AgentEvent =
  */
 export class OpencodeAgentAdapter {
   private readonly textVersions = new Map<string, string>();
-  private readonly publicTextParts = new Set<string>();
+  // OpenCode's delta only names the part ID. Its preceding snapshot supplies the type.
+  private readonly partEvents = new Map<string, "text" | "thinking">();
   private readonly seenTools = new Set<string>();
   private sawBusy = false;
   /** messageID → role (populated by message.updated SSE events) */
@@ -71,15 +72,17 @@ export class OpencodeAgentAdapter {
 
   private translatePart(evt: Extract<NormalizedEvent, { kind: "part" | "text-delta" }>): AgentEvent[] {
     if (evt.kind === "text-delta") {
-      if (!this.publicTextParts.has(evt.partID) || !evt.delta) return [];
+      const type = this.partEvents.get(evt.partID);
+      if (!type || !evt.delta) return [];
       const previous = this.textVersions.get(evt.partID) ?? "";
       this.textVersions.set(evt.partID, previous + evt.delta);
-      return [{ type: "text", delta: evt.delta }];
+      return [{ type, delta: evt.delta }];
     }
     const { partID, partType, text = "", delta, toolName, toolState } = evt;
 
     if (partType === "text" || partType === "reasoning") {
-      if (partType === "text") this.publicTextParts.add(partID);
+      const type = partType === "text" ? "text" : "thinking";
+      this.partEvents.set(partID, type);
       // Prefer the SSE delta field; fall back to computing delta from cumulative text.
       let d = delta ?? "";
       if (!d) {
@@ -88,7 +91,7 @@ export class OpencodeAgentAdapter {
       }
       this.textVersions.set(partID, text);
       if (!d) return [];
-      return [{ type: partType === "text" ? "text" : "thinking", delta: d }];
+      return [{ type, delta: d }];
     }
 
     if (partType === "tool") {

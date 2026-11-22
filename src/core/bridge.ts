@@ -1261,6 +1261,7 @@ export class Bridge {
         : this.runWithReply(evt, sid, parts, rt);
 
     try {
+      log.info(`run route session=${sessionId} message=${evt.message_id} topic=${evt.topic_key ?? "-"} style=${this.opts.config.replyStyle}`);
       await run(sessionId);
     } catch (err) {
       if (err instanceof SessionNotFoundError) {
@@ -1363,6 +1364,7 @@ export class Bridge {
     let messageId: string | null = null;
     try {
       messageId = await this.sender.sendCard(evt.chat_id, renderCard(state, meta), evt.topic_key ? evt.message_id : undefined);
+      log.info(`card created session=${sessionId} card=${messageId} message=${evt.message_id}`);
     } catch (err) {
       log.warn(`card send failed, falling back to reply mode: ${(err as Error).message}`);
       await this.runWithReply(evt, sessionId, parts, rt);
@@ -1404,16 +1406,26 @@ export class Bridge {
     rt.abort?.signal.addEventListener("abort", abortListener);
 
     const ch = this.consumer?.channel;
+    let liveUpdates = 0;
     const patch = async () => {
-      const card = renderCard(state, meta);
+      const snapshot = state;
+      const card = renderCard(snapshot, meta);
       try {
         if (ch) {
-          await ch.updateCard(messageId!, card);
+          const response = await ch.rawClient.im.v1.message.patch({
+            path: { message_id: messageId! }, data: { content: JSON.stringify(card) },
+          });
+          if (response.code !== 0) throw new Error(`Feishu code=${response.code} ${response.msg ?? ""}`);
         } else {
           await this.sender.patchCard({ messageId: messageId!, card });
         }
+        if (snapshot.terminal === "running") {
+          if (++liveUpdates === 1) log.info(`first live card update session=${sessionId} card=${messageId} stage=${snapshot.footer}`);
+        } else {
+          log.info(`final card update session=${sessionId} card=${messageId} liveUpdates=${liveUpdates} reasoningSeen=${!!snapshot.reasoning.content}`);
+        }
       } catch (err) {
-        log.warn(`card patch failed: ${(err as Error).message}`);
+        log.warn(`card patch failed session=${sessionId} card=${messageId}: ${(err as Error).message}`);
       }
     };
 

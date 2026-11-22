@@ -55,7 +55,8 @@ export function renderCard(state: RunState, meta: CardMeta): object {
   return {
     schema: "2.0",
     config: {
-      streaming_mode: state.terminal === "running",
+      // This card is updated as an IM message by message_id, not a CardKit streaming entity.
+      update_multi: true,
       summary: { content: summaryText(state) },
     },
     body: { elements },
