@@ -403,7 +403,8 @@ lark-opencode-bridge service install|start|stop|uninstall  （与 start/stop 等
 - `model` 字符串以第一个 `/` 切分为 `{providerID, modelID}`（opencode 期望的结构）
 - `defaultCwd` 在创建 session 时作为 `directory` 参数传入；`/cd` 切换 cwd 会重建该聊天的 session（opencode 在 session 创建时绑定 directory）
 - `allowedSenderOpenIds` / `allowedChatIds` — 空数组 = 不限。填 `ou_…` / `oc_…` 限制
-- `replyStyle` — `"card"`（默认，流式交互卡片）或 `"reply"`（普通 markdown 回复）
+- `replyStyle` — `"card"`（流式交互卡片）或 `"reply"`（默认，普通 markdown 回复）
+- `topicChatIds` — 可选，仅填写专门的话题群，例如 `["oc_…"]`。Bridge 通常会查询群信息识别这类群；如果机器人无权读取群信息，配置此项可以让缺少话题 ID 的首条消息也在原话题建卡。普通群里临时开启的话题由消息的 `thread_id` 自动识别。
 - `handleDocComments` — `true` 启用云文档评论 @ 回复
 - `manageOpencodeServer` — `false` 时指向外部已跑的 `opencode serve`
 
@@ -413,7 +414,7 @@ lark-opencode-bridge service install|start|stop|uninstall  （与 start/stop 等
 
 `config.replyStyle`：
 
-- **`card`**（默认）— bridge 立即发出"思考中…"卡片，订阅 opencode 的 SSE 事件流，每 ~800ms PATCH 卡片更新文本。仅渲染 `role: assistant` 的 parts，**不会回显用户自己的消息**。
+- **`card`** — 普通群和私聊在当前聊天建卡。话题内引用触发消息创建卡片，并随 OpenCode 的 SSE 事件更新同一张卡。同一群的不同话题各有自己的队列、OpenCode 会话和停止按钮。Bridge 与 OpenCode 可独立部署。
 - **`reply`** — bridge 等 prompt 完成后回单条 markdown 消息。
 
 ---

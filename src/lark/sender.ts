@@ -67,12 +67,12 @@ export class LarkSender {
    * Send an interactive card to a chat. Returns the new message_id from
    * lark-cli's response so callers can patch it later for streaming updates.
    */
-  async sendCard(chatId: string, card: unknown): Promise<string> {
+  async sendCard(chatId: string, card: unknown, threadParentId?: string): Promise<string> {
     const args = [
       "im",
-      "+messages-send",
-      "--chat-id",
-      chatId,
+      ...(threadParentId
+        ? ["+messages-reply", "--message-id", threadParentId, "--reply-in-thread"]
+        : ["+messages-send", "--chat-id", chatId]),
       "--msg-type",
       "interactive",
       "--content",

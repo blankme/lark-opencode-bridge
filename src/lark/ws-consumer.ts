@@ -30,6 +30,7 @@ export interface WsConsumerOptions {
  * events and interactive card action callbacks over the same WS connection.
  */
 export class LarkWsConsumer {
+  private readonly chatModes = new Map<string, { expires: number; topic: Promise<boolean> }>();
   private _channel: LarkChannel | null = null;
 
   constructor(private readonly opts: WsConsumerOptions) {}
@@ -148,6 +149,27 @@ export class LarkWsConsumer {
     return `state=${st.state} reconnectAttempts=${st.reconnectAttempts}`;
   }
 
+  /** A topic group's first message can arrive as an ordinary group event with no thread ID. */
+  isTopicGroup(chatId: string): Promise<boolean> {
+    const ch = this._channel;
+    if (!ch) return Promise.resolve(false);
+    const cached = this.chatModes.get(chatId);
+    if (cached && cached.expires > Date.now()) return cached.topic;
+    const entry = {
+      expires: Date.now() + 300_000,
+      topic: ch.rawClient.im.v1.chat.get({ path: { chat_id: chatId } }).then(res => {
+        if (res.code || !res.data?.chat_mode) throw new Error(res.msg ?? "missing chat_mode");
+        return res.data.chat_mode === "topic";
+      }).catch(err => {
+        entry.expires = Date.now() + 30_000;
+        log.warn(`chat mode lookup failed for ${chatId}; configure topicChatIds for topic groups: ${err.message}`);
+        return false;
+      }),
+    };
+    this.chatModes.set(chatId, entry);
+    return entry.topic;
+  }
+
   /** Fetch quoted/replied message text via the SDK (same auth as WS). */
   async fetchMessageText(messageId: string): Promise<string | null> {
     const ch = this._channel;
@@ -175,7 +197,7 @@ export class LarkWsConsumer {
   }
 }
 
-function adaptMessage(msg: NormalizedMessage): LarkMessageEvent | null {
+export function adaptMessage(msg: NormalizedMessage): LarkMessageEvent {
   const mentions: MentionInfo[] = msg.mentions.map((m) => ({
     key: m.key,
     openId: m.openId,
@@ -187,7 +209,9 @@ function adaptMessage(msg: NormalizedMessage): LarkMessageEvent | null {
     event_id: msg.messageId,
     message_id: msg.messageId,
     chat_id: msg.chatId,
-    chat_type: (msg.chatType as string) === "p2p" ? "p2p" : "group",
+    chat_type: msg.chatType,
+    root_id: msg.rootId && msg.rootId !== "0" ? msg.rootId : undefined,
+    thread_id: msg.threadId && msg.threadId !== "0" ? msg.threadId : undefined,
     sender_id: msg.senderId,
     message_type: msg.rawContentType,
     content: msg.content,

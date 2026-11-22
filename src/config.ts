@@ -20,6 +20,8 @@ export interface BridgeConfig {
   allowedSenderOpenIds: string[];
   /** Allowlist of chat_ids the bot will respond in (groups only). Empty = all. */
   allowedChatIds: string[];
+  /** Topic-only groups whose mode is known without looking up Feishu chat metadata. */
+  topicChatIds?: string[];
   /** When non-empty, only these open_ids may run sensitive slash commands. */
   adminOpenIds: string[];
   /** When true (default), group messages require @bot unless /spawn chat. */

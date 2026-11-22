@@ -23,6 +23,10 @@ export interface LarkMessageEvent {
   content: string;
   create_time: string;
   mentions: MentionInfo[];
+  thread_id?: string;
+  root_id?: string;
+  /** Session and queue scope for a card originating inside a topic. */
+  topic_key?: string;
   /** When the user replies to or quotes another message, Feishu sets parent_id. */
   reply_to_message_id?: string;
 }
@@ -43,6 +47,10 @@ export interface LarkCommentEvent {
 }
 
 export type LarkInboundEvent = LarkMessageEvent | LarkCommentEvent;
+
+export function conversationKey(evt: LarkMessageEvent): string {
+  return evt.topic_key ? `${evt.chat_id}/${evt.topic_key}` : evt.chat_id;
+}
 
 export function isMessageEvent(e: LarkInboundEvent): e is LarkMessageEvent {
   return e.kind === "message";

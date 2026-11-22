@@ -12,6 +12,7 @@ export interface RawOpencodeEvent {
 /** Normalized events the bridge cares about (one per SSE message). */
 export type NormalizedEvent =
   | { kind: "connected" }
+  | { kind: "text-delta"; sessionID: string; messageID: string; partID: string; delta: string }
   | {
       kind: "message";
       sessionID: string;
@@ -141,6 +142,7 @@ export class OpencodeEventStream extends EventEmitter {
     switch (evt.kind) {
       case "message":
       case "part":
+      case "text-delta":
       case "status":
       case "permission":
         return evt.sessionID === target;
@@ -155,6 +157,13 @@ export class OpencodeEventStream extends EventEmitter {
 
 function normalize(env: RawOpencodeEvent): NormalizedEvent | null {
   if (env.type === "server.connected") return { kind: "connected" };
+
+  if (env.type === "message.part.delta") {
+    const { field, sessionID, messageID, partID, delta } = env.properties;
+    if (field !== "text" || typeof delta !== "string" || typeof sessionID !== "string" ||
+        typeof messageID !== "string" || typeof partID !== "string") return null;
+    return { kind: "text-delta", sessionID, messageID, partID, delta };
+  }
 
   if (env.type === "message.updated") {
     const info = (env.properties as { info?: Record<string, unknown> }).info;

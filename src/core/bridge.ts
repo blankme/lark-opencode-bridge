@@ -44,6 +44,7 @@ import { initialState, reduce, markInterrupted, finalizeIfRunning } from "../car
 import type { RunState } from "../card/run-state.js";
 import { renderCard } from "../card/run-renderer.js";
 import {
+  conversationKey,
   isCommentEvent,
   isMessageEvent,
   type LarkCommentEvent,
@@ -271,7 +272,7 @@ export class Bridge {
     // skip the mention gate. Set requireGroupMention=false to accept all group
     // messages without @ (legacy behaviour).
     if (
-      evt.chat_type === "group" &&
+      evt.chat_type !== "p2p" &&
       !this.sessions.isSpawned(evt.chat_id) &&
       cfg.requireGroupMention &&
       !this.isBotMentioned(evt)
@@ -282,6 +283,11 @@ export class Bridge {
       return;
     }
 
+    if (cfg.replyStyle === "card" && evt.chat_type !== "p2p") {
+      const topicGroup = evt.chat_type === "topic" || cfg.topicChatIds?.includes(evt.chat_id)
+        || await this.consumer?.isTopicGroup(evt.chat_id);
+      evt.topic_key = topicGroup ? evt.root_id ?? evt.message_id : evt.thread_id;
+    }
     const text = stripMentions(extractTextContent(evt), evt.mentions);
     const slash = text ? parseSlash(text) : null;
 
@@ -291,7 +297,7 @@ export class Bridge {
       return;
     }
 
-    this.getQueue(evt.chat_id).enqueue(evt);
+    this.getQueue(conversationKey(evt)).enqueue(evt);
   }
 
   private getQueue(chatId: string): ChatPendingQueue {
@@ -462,14 +468,15 @@ export class Bridge {
       await this.replyMarkdown(evt, "❌ 此命令仅管理员可用。");
       return;
     }
-    const rt = this.getRt(evt.chat_id);
+    const key = conversationKey(evt);
+    const rt = this.getRt(key);
     switch (cmd.name) {
       case "help":
         await this.replyMarkdown(evt, HELP_TEXT);
         return;
       case "new": {
-        const oldId = this.sessions.getSession(evt.chat_id);
-        this.sessions.clearSession(evt.chat_id);
+        const oldId = this.sessions.getSession(key);
+        this.sessions.clearSession(key);
         await this.replyMarkdown(
           evt,
           oldId ? `Session reset (previous: \`${oldId}\`).` : "No active session to reset.",
@@ -489,7 +496,7 @@ export class Bridge {
           );
           return;
         }
-        this.setChatCwd(evt.chat_id, target);
+        this.setChatCwd(key, target);
         await this.replyMarkdown(
           evt,
           `cwd set to \`${target}\` — session will be reinitialised on the next prompt.`,
@@ -497,8 +504,8 @@ export class Bridge {
         return;
       }
       case "status": {
-        const sessionId = this.sessions.getSession(evt.chat_id) ?? "(none)";
-        const cwd = this.chatCwd(evt.chat_id) ?? "(opencode default)";
+        const sessionId = this.sessions.getSession(key) ?? "(none)";
+        const cwd = this.chatCwd(key) ?? "(opencode default)";
         const agent = rt.agent ?? this.opts.config.agent ?? "(opencode default)";
         const model = rt.model ?? this.opts.config.model ?? "(opencode default)";
         const body = [
@@ -515,7 +522,7 @@ export class Bridge {
         return;
       }
       case "stop": {
-        const sessionId = this.sessions.getSession(evt.chat_id);
+        const sessionId = this.sessions.getSession(key);
         if (sessionId) await this.client.abortSession(sessionId);
         if (rt.abort) {
           rt.abort.abort();
@@ -602,7 +609,7 @@ export class Bridge {
     const opts = configFormOptsFromBridge(this.opts.config);
     const card = configFormCard(opts);
     try {
-      await this.sender.sendCard(evt.chat_id, card);
+      await this.sender.sendCard(evt.chat_id, card, evt.topic_key ? evt.message_id : undefined);
     } catch (err) {
       await this.replyMarkdown(evt, `无法发送配置卡片：${(err as Error).message}`);
     }
@@ -859,7 +866,7 @@ export class Bridge {
       await this.replyMarkdown(evt, "No sessions yet.");
       return;
     }
-    const currentForChat = this.sessions.getSession(evt.chat_id);
+    const currentForChat = this.sessions.getSession(conversationKey(evt));
     const lines: string[] = [`**Sessions** (${sessions.length})`, ""];
     for (const s of sessions.slice(0, 25)) {
       const tail = s.id === currentForChat ? "  _(← this chat)_" : "";
@@ -876,7 +883,7 @@ export class Bridge {
     evt: LarkMessageEvent,
     rt: PerChatRuntime,
   ): Promise<void> {
-    const sessionId = this.sessions.getSession(evt.chat_id);
+    const sessionId = this.sessions.getSession(conversationKey(evt));
     if (!sessionId) {
       await this.replyMarkdown(evt, "No active session to compact. Send a prompt first.");
       return;
@@ -902,7 +909,7 @@ export class Bridge {
 
   /** `/share` — opencode `POST /session/{id}/share`. */
   private async handleShare(evt: LarkMessageEvent): Promise<void> {
-    const sessionId = this.sessions.getSession(evt.chat_id);
+    const sessionId = this.sessions.getSession(conversationKey(evt));
     if (!sessionId) {
       await this.replyMarkdown(evt, "No active session to share. Send a prompt first.");
       return;
@@ -922,7 +929,7 @@ export class Bridge {
 
   /** `/unshare` — opencode `DELETE /session/{id}/share`. */
   private async handleUnshare(evt: LarkMessageEvent): Promise<void> {
-    const sessionId = this.sessions.getSession(evt.chat_id);
+    const sessionId = this.sessions.getSession(conversationKey(evt));
     if (!sessionId) {
       await this.replyMarkdown(evt, "No active session.");
       return;
@@ -941,7 +948,7 @@ export class Bridge {
    * the last user message.
    */
   private async handleUndo(evt: LarkMessageEvent): Promise<void> {
-    const sessionId = this.sessions.getSession(evt.chat_id);
+    const sessionId = this.sessions.getSession(conversationKey(evt));
     if (!sessionId) {
       await this.replyMarkdown(evt, "No active session to undo.");
       return;
@@ -971,7 +978,7 @@ export class Bridge {
 
   /** `/redo` — opencode `POST /session/{id}/unrevert`. */
   private async handleRedo(evt: LarkMessageEvent): Promise<void> {
-    const sessionId = this.sessions.getSession(evt.chat_id);
+    const sessionId = this.sessions.getSession(conversationKey(evt));
     if (!sessionId) {
       await this.replyMarkdown(evt, "No active session to redo.");
       return;
@@ -994,7 +1001,7 @@ export class Bridge {
     evt: LarkMessageEvent,
     _rt: PerChatRuntime,
   ): Promise<void> {
-    const cwd = this.chatCwd(evt.chat_id);
+    const cwd = this.chatCwd(conversationKey(evt));
     const instruction = [
       "Initialize this project for opencode.",
       "Analyze the codebase structure, coding patterns, and conventions, then",
@@ -1059,7 +1066,7 @@ export class Bridge {
       return;
     }
 
-    const cwd = this.chatCwd(evt.chat_id) ?? this.opts.config.defaultCwd;
+    const cwd = this.chatCwd(conversationKey(evt)) ?? this.opts.config.defaultCwd;
     const groupName = formatGroupName(topic);
     const description = SPAWN_GROUP_DESCRIPTION;
 
@@ -1156,7 +1163,7 @@ export class Bridge {
         return;
       }
       const explicit = rest.slice(1).join(" ").trim();
-      const dir = explicit || this.chatCwd(evt.chat_id) || process.cwd();
+      const dir = explicit || this.chatCwd(conversationKey(evt)) || process.cwd();
       const ws = this.workspaces.save(name, dir);
       await this.replyMarkdown(evt, `Saved workspace **${ws.name}** → \`${ws.path}\``);
       return;
@@ -1172,7 +1179,7 @@ export class Bridge {
         await this.replyMarkdown(evt, `No workspace named **${name}**. Use \`${prefix} list\`.`);
         return;
       }
-      this.setChatCwd(evt.chat_id, ws.path);
+      this.setChatCwd(conversationKey(evt), ws.path);
       await this.replyMarkdown(
         evt,
         `Switched to workspace **${name}** (\`${ws.path}\`) — session reset.`,
@@ -1209,7 +1216,7 @@ export class Bridge {
    * that wrote garbage into sessions.json).
    */
   private chatCwd(chatId: string): string | undefined {
-    const stored = this.sessions.getCwd(chatId);
+    const stored = this.sessions.getCwd(chatId) ?? this.sessions.getCwd(chatId.split("/")[0]!);
     if (stored && path.isAbsolute(stored)) return stored;
     return this.opts.config.defaultCwd;
   }
@@ -1240,12 +1247,13 @@ export class Bridge {
   }
 
   private async handlePromptCore(evt: LarkMessageEvent, parts: PromptPart[]): Promise<void> {
-    const rt = this.getRt(evt.chat_id);
-    let sessionId = await this.ensureChatSession(evt.chat_id);
+    const key = conversationKey(evt);
+    const rt = this.getRt(key);
+    let sessionId = await this.ensureChatSession(key);
 
     rt.abort?.abort();
     rt.abort = new AbortController();
-    this.startIdleWatchdog(evt.chat_id, rt);
+    this.startIdleWatchdog(key, rt);
 
     const run = (sid: string) =>
       this.opts.config.replyStyle === "card"
@@ -1257,8 +1265,8 @@ export class Bridge {
     } catch (err) {
       if (err instanceof SessionNotFoundError) {
         log.warn(`stale session ${sessionId} for chat ${evt.chat_id} — clearing and retrying`);
-        this.sessions.clearSession(evt.chat_id);
-        sessionId = await this.ensureChatSession(evt.chat_id);
+        this.sessions.clearSession(key);
+        sessionId = await this.ensureChatSession(key);
         rt.abort = new AbortController();
         await run(sessionId);
       } else {
@@ -1269,7 +1277,7 @@ export class Bridge {
       // Best-effort: after the first response in a /spawn-ed chat, sync the
       // opencode-generated session title into the Lark group name. Errors here
       // shouldn't surface to the user.
-      void this.maybeSyncSpawnedChatName(evt.chat_id, sessionId).catch((e) =>
+      void this.maybeSyncSpawnedChatName(key, sessionId).catch((e) =>
         log.warn(`title sync failed: ${(e as Error).message}`),
       );
     }
@@ -1344,7 +1352,7 @@ export class Bridge {
     rt: PerChatRuntime,
   ): Promise<void> {
     const meta = {
-      chatId: evt.chat_id,
+      chatId: conversationKey(evt),
       agent: rt.agent ?? this.opts.config.agent,
       model: rt.model ?? this.opts.config.model,
     };
@@ -1354,7 +1362,7 @@ export class Bridge {
 
     let messageId: string | null = null;
     try {
-      messageId = await this.sender.sendCard(evt.chat_id, renderCard(state, meta));
+      messageId = await this.sender.sendCard(evt.chat_id, renderCard(state, meta), evt.topic_key ? evt.message_id : undefined);
     } catch (err) {
       log.warn(`card send failed, falling back to reply mode: ${(err as Error).message}`);
       await this.runWithReply(evt, sessionId, parts, rt);
@@ -1409,11 +1417,12 @@ export class Bridge {
       }
     };
 
+    let updating: Promise<void> | undefined;
     const patcher = setInterval(() => {
-      if (!dirty) return;
+      if (!dirty || updating) return;
       dirty = false;
       rt.idleWatchdog?.touch();
-      void patch();
+      updating = patch().finally(() => { updating = undefined; });
     }, CARD_PATCH_INTERVAL_MS);
 
     // Capture the abort signal now so we can check it after rt.abort is cleared.
@@ -1449,6 +1458,7 @@ export class Bridge {
       rt.abort = undefined;
       clearInterval(patcher);
       stream.close();
+      await updating;
       await patch();
     }
   }
@@ -1466,7 +1476,7 @@ export class Bridge {
 
   private async replyMarkdown(evt: LarkMessageEvent, body: string): Promise<void> {
     try {
-      await this.sender.reply({ messageId: evt.message_id, markdown: body });
+      await this.sender.reply({ messageId: evt.message_id, markdown: body, replyInThread: !!evt.topic_key });
     } catch (err) {
       log.error(`reply failed: ${(err as Error).message}`);
     }

@@ -402,7 +402,8 @@ lark-opencode-bridge service install|start|stop|uninstall  (equivalent to start/
 - `model` is split on the first `/` into `{providerID, modelID}` (what opencode expects).
 - `defaultCwd` becomes the `directory` parameter when the bridge creates a session for a chat. Changing cwd via `/cd` rebuilds the session because opencode binds `directory` at session creation.
 - `allowedSenderOpenIds` / `allowedChatIds` — empty array = unrestricted. Add `ou_…` / `oc_…` IDs to restrict.
-- `replyStyle` — `"card"` (default, streaming interactive card) or `"reply"` (plain markdown reply).
+- `replyStyle` — `"card"` (streaming interactive card) or `"reply"` (default, plain markdown reply).
+- `topicChatIds` — optional IDs of dedicated topic groups, e.g. `["oc_…"]`. Bridge normally looks up the chat mode. Set this when the bot cannot read chat metadata so even a root event without a thread ID gets a topic card. Threads in ordinary groups are recognized from the message's `thread_id`.
 - `handleDocComments` — `true` enables Feishu doc-comment `@`-mention handling.
 - `manageOpencodeServer` — set to `false` to point at an externally running `opencode serve`.
 
@@ -412,7 +413,7 @@ Friendlier: send `/config` in Feishu for an interactive settings card.
 
 `config.replyStyle`:
 
-- **`card`** (default) — bridge immediately sends a "thinking…" card, subscribes to opencode's SSE event stream, and PATCHes the card every ~800 ms with the latest text. Only parts of messages with `role: assistant` are rendered, so the user's own message is never echoed back.
+- **`card`** — Bridge sends a card to the current group or direct chat. Inside a topic, it replies to the triggering message and streams OpenCode updates to that same card. Each topic has its own queue, OpenCode session and stop button, including when OpenCode runs on another host.
 - **`reply`** — bridge waits for the prompt to complete, then posts a single threaded markdown reply.
 
 ---
