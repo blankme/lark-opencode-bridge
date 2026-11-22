@@ -69,6 +69,7 @@ export interface MessageSummary {
 
 export interface PromptOptions {
   sessionId: string;
+  directory?: string;
   parts: PromptPart[];
   agent?: string;
   /** "providerID/modelID" — parsed and forwarded to opencode. */
@@ -84,6 +85,12 @@ export interface PromptResult {
   text: string;
   /** Raw response body (assistant message + parts) for debugging. */
   raw: unknown;
+}
+
+export interface StoredReply {
+  paragraphs: string[];
+  done: boolean;
+  error?: string;
 }
 
 export class SessionNotFoundError extends Error {
@@ -251,9 +258,10 @@ export class OpencodeClient {
     await this.fetchJson("DELETE", `/session/${encodeURIComponent(id)}`);
   }
 
-  async abortSession(id: string): Promise<void> {
+  async abortSession(id: string, directory?: string): Promise<void> {
     try {
-      await this.fetchJson("POST", `/session/${encodeURIComponent(id)}/abort`);
+      const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
+      await this.fetchJson("POST", `/session/${encodeURIComponent(id)}/abort${qs}`);
     } catch (err) {
       log.warn(`abort failed: ${(err as Error).message}`);
     }
@@ -338,7 +346,8 @@ export class OpencodeClient {
 
   async prompt(o: PromptOptions): Promise<PromptResult> {
     const body = this.buildPromptBody(o);
-    const path = `/session/${encodeURIComponent(o.sessionId)}/message`;
+    const qs = o.directory ? `?directory=${encodeURIComponent(o.directory)}` : "";
+    const path = `/session/${encodeURIComponent(o.sessionId)}/message${qs}`;
     const res = await this.fetchJson("POST", path, body, o.signal);
     return { text: extractText(res), raw: res };
   }
@@ -351,10 +360,34 @@ export class OpencodeClient {
    * (e.g. one that triggers the `question` tool) doesn't blow Node fetch's
    * default 5-minute idle timeout.
    */
-  async promptAsync(o: PromptOptions): Promise<void> {
+  async promptAsync(o: PromptOptions & { messageID?: string }): Promise<void> {
     const body = this.buildPromptBody(o);
-    const path = `/session/${encodeURIComponent(o.sessionId)}/prompt_async`;
+    if (o.messageID) body.messageID = o.messageID;
+    const qs = o.directory ? `?directory=${encodeURIComponent(o.directory)}` : "";
+    const path = `/session/${encodeURIComponent(o.sessionId)}/prompt_async${qs}`;
     await this.fetchJson("POST", path, body, o.signal);
+  }
+
+  async readStoredReply(sessionId: string, parentID: string, directory: string | undefined, signal: AbortSignal): Promise<StoredReply | undefined> {
+    const query = new URLSearchParams({ limit: "64" });
+    if (directory) query.set("directory", directory);
+    const rows = await this.fetchJson("GET", `/session/${encodeURIComponent(sessionId)}/message?${query}`, undefined, signal);
+    if (!Array.isArray(rows)) return;
+    const replies = rows.filter(row => row?.info?.role === "assistant" &&
+      row.info.parentID === parentID && row.info.sessionID === sessionId);
+    const last = replies.at(-1)?.info;
+    if (!last) return;
+    const paragraphs: string[] = [];
+    for (const row of replies) {
+      if (!Array.isArray(row.parts)) continue;
+      for (const part of row.parts) {
+        if (part?.type === "text" && !part.ignored && !part.synthetic && typeof part.text === "string" && part.text) {
+          paragraphs.push(part.text);
+        }
+      }
+    }
+    const error = last.error ? last.error.data?.message || last.error.name || "OpenCode session error" : undefined;
+    return { paragraphs, error, done: !!last.time?.completed && !!last.finish && !["tool-calls", "unknown"].includes(last.finish) };
   }
 
   private buildPromptBody(o: PromptOptions): Record<string, unknown> {

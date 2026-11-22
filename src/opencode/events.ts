@@ -38,11 +38,12 @@ export type NormalizedEvent =
       sessionID: string;
       requestID: string;
     }
-  | { kind: "error"; sessionID?: string; message: string }
+  | { kind: "error"; sessionID?: string; message: string; transport?: boolean }
   | { kind: "raw"; envelope: RawOpencodeEvent };
 
 export interface SubscribeOptions {
   baseUrl: string;
+  directory?: string;
   /** When set, only events whose payload mentions this sessionID are forwarded. */
   sessionID?: string;
   /** Forward all events unfiltered (overrides sessionID filter). */
@@ -63,7 +64,8 @@ export class OpencodeEventStream extends EventEmitter {
   }
 
   async start(): Promise<void> {
-    const url = `${this.opts.baseUrl}/event`;
+    const url = new URL("/event", this.opts.baseUrl);
+    if (this.opts.directory) url.searchParams.set("directory", this.opts.directory);
     log.debug(`SSE → ${url} (session=${this.opts.sessionID ?? "*"})`);
     const res = await fetch(url, {
       headers: { accept: "text/event-stream" },
@@ -102,7 +104,7 @@ export class OpencodeEventStream extends EventEmitter {
       if (!this.closed) {
         const msg = (err as Error)?.message ?? String(err);
         log.warn(`SSE pump error: ${msg}`);
-        this.emit("event", { kind: "error", message: msg } satisfies NormalizedEvent);
+        this.emit("event", { kind: "error", message: msg, transport: true } satisfies NormalizedEvent);
       }
     } finally {
       this.emit("close");

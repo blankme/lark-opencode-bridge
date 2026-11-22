@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { it } from "node:test";
 import type { LarkChannel, NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { Bridge } from "../src/core/bridge.js";
@@ -14,9 +17,9 @@ function incoming(id: string, fields: Partial<NormalizedMessage> = {}) {
   } as NormalizedMessage);
 }
 
-function makeBridge(port = 4096, topicChatIds: string[] = []) {
+function makeBridge(port = 4096, topicChatIds: string[] = [], defaultCwd?: string) {
   const bridge = new Bridge({ config: baseConfig({
-    replyStyle: "card", opencodePort: port, topicChatIds, requireGroupMention: false,
+    replyStyle: "card", opencodePort: port, topicChatIds, requireGroupMention: false, defaultCwd,
     manageOpencodeServer: false, idleTimeoutMinutes: 0, messageBatchMs: 60_000,
   }) });
   const sessions = new Map<string, string>();
@@ -93,18 +96,84 @@ it("sends cards directly to ordinary chats and DMs", async () => {
   ]);
 });
 
+it("recovers persisted text for only the current DM turn when the event stream stays silent", { timeout: 25_000 }, async () => {
+  const externalPort = Number(process.env.TOPIC_TEST_OPENCODE_PORT);
+  const directory = await mkdtemp(join(tmpdir(), "bridge dm "));
+  let parentID = "";
+  let reads = 0;
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url!, "http://localhost");
+    if (url.searchParams.get("directory") !== directory) { res.writeHead(400).end(); return; }
+    if (url.pathname === "/event") {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.flushHeaders();
+      return;
+    }
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    if (externalPort) {
+      const upstream = await fetch(`http://127.0.0.1:${externalPort}${req.url}`, {
+        method: req.method, headers: { "content-type": "application/json" }, body: body || undefined,
+      });
+      res.writeHead(upstream.status).end(await upstream.text());
+      return;
+    }
+    if (url.pathname === "/session") { res.end(JSON.stringify({ id: "ses_dm" })); return; }
+    if (url.pathname.endsWith("/prompt_async")) {
+      parentID = JSON.parse(body).messageID;
+      res.writeHead(204).end();
+      return;
+    }
+    if (url.pathname !== "/session/ses_dm/message") { res.writeHead(404).end(); return; }
+    const info = { role: "assistant", sessionID: "ses_dm", parentID, time: { completed: 100 }, finish: "tool-calls" };
+    const rows = [
+      { info: { ...info, parentID: "older-turn", finish: "stop" }, parts: [{ type: "text", text: "old answer" }] },
+      { info, parts: [{ type: "text", text: "reply-alpha" }] },
+    ];
+    if (++reads > 1) rows.push({ info: { ...info, finish: "stop" }, parts: [{ type: "text", text: " done" }] });
+    res.end(JSON.stringify(rows));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { bridge } = makeBridge((server.address() as { port: number }).port, [], directory);
+  const cards: string[] = [];
+  bridge["sender"].sendCard = async () => "om_dm_card";
+  bridge["sender"].patchCard = async ({ messageId, card }) => {
+    assert.equal(messageId, "om_dm_card");
+    cards.push(JSON.stringify(card));
+  };
+  try {
+    await bridge["handleInbound"](incoming("om_dm", { chatType: "p2p", content: "reply-alpha via-tool" }));
+    await bridge["pendingQueues"].get("oc_group")!.drain();
+    if (!externalPort) assert.match(parentID, /^msg_[0-9a-f]{26}$/);
+    assert.ok(cards.slice(0, -1).some(c => c.includes("reply-alpha") && !c.includes(" done")));
+    assert.ok(cards.at(-1)?.includes(" done"));
+    assert.ok(cards.every(c => !c.includes("old answer")));
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 // The local HTTP server speaks OpenCode's session, async prompt and SSE protocols.
 // An external test model should stream "checking-" + prompt as a reasoning summary,
 // pause for a card refresh, then echo the prompt as visible text before finishing.
 // Point TOPIC_TEST_OPENCODE_PORT at its isolated OpenCode server.
 it("streams simultaneous topics to their own reply card before each run completes", { timeout: 25_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "bridge project & "));
   const streams = new Set<ServerResponse>();
   const emit = (type: string, properties: object) => {
     for (const res of streams) res.write("data: " + JSON.stringify({ type, properties }) + "\n\n");
   };
   let serial = 0;
   const server = createServer(async (req, res) => {
-    if (req.url === "/event") {
+    const url = new URL(req.url!, "http://localhost");
+    if (url.searchParams.get("directory") !== directory) {
+      res.writeHead(404).end("wrong OpenCode directory");
+      return;
+    }
+    if (url.pathname === "/event") {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.flushHeaders();
       streams.add(res);
@@ -113,11 +182,11 @@ it("streams simultaneous topics to their own reply card before each run complete
     }
     let body = "";
     for await (const chunk of req) body += chunk;
-    if (req.url === "/session") {
+    if (url.pathname === "/session") {
       res.end(JSON.stringify({ id: "ses_" + ++serial }));
       return;
     }
-    const sid = req.url?.match(/^\/session\/(ses_\w+)\/prompt_async$/)?.[1];
+    const sid = url.pathname.match(/^\/session\/(ses_\w+)\/prompt_async$/)?.[1];
     if (!sid) { res.writeHead(404).end(); return; }
     res.writeHead(204).end();
     const text = JSON.parse(body).parts[0].text;
@@ -141,7 +210,7 @@ it("streams simultaneous topics to their own reply card before each run complete
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const externalPort = Number(process.env.TOPIC_TEST_OPENCODE_PORT);
-  const { bridge, sessions } = makeBridge(externalPort || (server.address() as { port: number }).port);
+  const { bridge, sessions } = makeBridge(externalPort || (server.address() as { port: number }).port, [], directory);
   const roots = ["om_alpha", "om_beta"];
   const marker = (root: string) => "reply-" + root.slice(3);
   const created = new Set<string>();
@@ -196,5 +265,6 @@ it("streams simultaneous topics to their own reply card before each run complete
     for (const res of streams) res.end();
     server.closeAllConnections();
     server.close();
+    await rm(directory, { recursive: true, force: true });
   }
 });

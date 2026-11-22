@@ -1,4 +1,6 @@
 import path from "node:path";
+import { randomBytes } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { createLogger, pruneOldLogs, recentLogEntries } from "../log.js";
 import type { BridgeConfig } from "../config.js";
 import { saveConfig } from "../config.js";
@@ -74,6 +76,7 @@ interface PerChatRuntime {
 }
 
 const CARD_PATCH_INTERVAL_MS = 800;
+const CARD_HISTORY_INTERVAL_MS = 4_000;
 
 /**
  * Tool toggles forwarded with every prompt. We disable opencode's `question`
@@ -319,7 +322,7 @@ export class Bridge {
     if (!rt?.abort) return;
     log.info(`preempt: aborting in-flight run for chat=${chatId}`);
     rt.abort.abort();
-    if (sessionId) void this.client.abortSession(sessionId).catch(() => undefined);
+    if (sessionId) void this.client.abortSession(sessionId, this.cardDirectory(chatId)).catch(() => undefined);
   }
 
   private async dispatchBatch(evts: LarkMessageEvent[]): Promise<void> {
@@ -451,7 +454,7 @@ export class Bridge {
         log.warn(`idle timeout for chat=${chatId}`);
         this.preemptChat(chatId);
         const sessionId = this.sessions.getSession(chatId);
-        if (sessionId) await this.client.abortSession(sessionId).catch(() => undefined);
+        if (sessionId) await this.client.abortSession(sessionId, this.cardDirectory(chatId)).catch(() => undefined);
       },
     });
     rt.idleWatchdog = watchdog;
@@ -523,7 +526,7 @@ export class Bridge {
       }
       case "stop": {
         const sessionId = this.sessions.getSession(key);
-        if (sessionId) await this.client.abortSession(sessionId);
+        if (sessionId) await this.client.abortSession(sessionId, this.cardDirectory(key));
         if (rt.abort) {
           rt.abort.abort();
           await this.replyMarkdown(evt, "Cancelled the in-flight run.");
@@ -1221,6 +1224,10 @@ export class Bridge {
     return this.opts.config.defaultCwd;
   }
 
+  private cardDirectory(key: string): string | undefined {
+    return this.opts.config.replyStyle === "card" ? this.chatCwd(key) : undefined;
+  }
+
   private async ensureChatSession(chatId: string): Promise<string> {
     let sessionId = this.sessions.getSession(chatId);
     if (!sessionId) {
@@ -1330,6 +1337,7 @@ export class Bridge {
     try {
       const result = await this.client.prompt({
         sessionId,
+        directory: this.cardDirectory(conversationKey(evt)),
         parts,
         agent: rt.agent,
         model: rt.model,
@@ -1372,35 +1380,50 @@ export class Bridge {
     }
 
     const adapter = new OpencodeAgentAdapter();
+    const directory = this.chatCwd(meta.chatId);
+    // Match OpenCode's ascending msg_ format. The parent ID ties stored assistant
+    // messages to this prompt even when a topic reuses an existing session.
+    const timePrefix = (Date.now() * 0x1000).toString(16).slice(-12).padStart(12, "0");
+    const parentID = `msg_${timePrefix}${randomBytes(7).toString("hex")}`;
+    const history = new AbortController();
+    let lastProgress = Date.now();
+    let useHistory = false;
     const stream = new OpencodeEventStream({
       baseUrl: `http://${this.opts.config.opencodeHost}:${this.opts.config.opencodePort}`,
       sessionID: sessionId,
+      directory,
     });
 
     const answeredPermissions = new Set<string>();
     const completion = new Promise<void>((resolve, reject) => {
       stream.on("event", (e) => {
+        if (e.kind === "error" && e.transport) return; // The close handler enables history recovery.
         rt.idleWatchdog?.touch();
         // Auto-approve tool permission prompts.
         if (e.kind === "permission" && e.sessionID === sessionId) {
           if (answeredPermissions.has(e.requestID)) return;
           answeredPermissions.add(e.requestID);
           log.info(`auto-approving permission ${e.requestID}`);
-          void this.client.replyPermission(e.requestID, "always").catch((err) => {
+          void this.client.replyPermission(e.requestID, "always", directory).catch((err) => {
             log.warn(`permission auto-approve failed: ${(err as Error).message}`);
           });
           return;
         }
         const agentEvents = adapter.translate(e, sessionId);
         for (const ae of agentEvents) {
+          if (useHistory && (ae.type === "text" || ae.type === "done")) continue;
+          if (!useHistory) lastProgress = Date.now();
           state = reduce(state, ae);
           dirty = true;
           if (ae.type === "done") resolve();
           else if (ae.type === "error") reject(new Error(ae.message));
         }
       });
-      stream.on("close", () => resolve());
+      stream.on("close", () => { lastProgress = 0; });
+      rt.abort?.signal.addEventListener("abort", () => resolve(), { once: true, signal: history.signal });
     });
+    // The stream can fail while the prompt POST is still being acknowledged.
+    void completion.catch(() => undefined);
 
     const abortListener = () => stream.close();
     rt.abort?.signal.addEventListener("abort", abortListener);
@@ -1422,7 +1445,7 @@ export class Bridge {
         if (snapshot.terminal === "running") {
           if (++liveUpdates === 1) log.info(`first live card update session=${sessionId} card=${messageId} stage=${snapshot.footer}`);
         } else {
-          log.info(`final card update session=${sessionId} card=${messageId} liveUpdates=${liveUpdates} reasoningSeen=${!!snapshot.reasoning.content}`);
+          log.info(`final card update session=${sessionId} card=${messageId} liveUpdates=${liveUpdates} reasoningSeen=${!!snapshot.reasoning.content} terminal=${snapshot.terminal} source=${useHistory ? "history" : "events"}`);
         }
       } catch (err) {
         log.warn(`card patch failed session=${sessionId} card=${messageId}: ${(err as Error).message}`);
@@ -1439,19 +1462,79 @@ export class Bridge {
 
     // Capture the abort signal now so we can check it after rt.abort is cleared.
     const abortSignal = rt.abort?.signal;
+    const readReply = (cancel?: AbortSignal) => {
+      const timeout = AbortSignal.timeout(8_000);
+      return this.client.readStoredReply(sessionId, parentID, directory, cancel ? AbortSignal.any([cancel, timeout]) : timeout);
+    };
+    const replaceStoredText = (paragraphs: string[]) => {
+      state = { ...state, footer: "streaming", reasoning: { ...state.reasoning, active: false },
+        blocks: [...state.blocks.filter(b => b.kind !== "text"),
+          ...paragraphs.map(content => ({ kind: "text" as const, content, streaming: false }))] };
+      dirty = true;
+    };
+    const monitorHistory = async () => {
+      let previousText: string | undefined;
+      let warned = false;
+      while (!history.signal.aborted) {
+        await delay(CARD_HISTORY_INTERVAL_MS, undefined, { signal: history.signal });
+        if (!useHistory && Date.now() - lastProgress < CARD_HISTORY_INTERVAL_MS) continue;
+        const observedProgress = lastProgress;
+        try {
+          const reply = await readReply(history.signal);
+          if (history.signal.aborted || abortSignal?.aborted || observedProgress !== lastProgress || !reply) continue;
+          const text = reply.paragraphs.join("\n\n");
+          if (!text && !reply.done && !reply.error) continue;
+          if (!useHistory && !reply.done && !reply.error) {
+            const visible = state.blocks.flatMap(b => b.kind === "text" ? [b.content] : []).join("\n\n");
+            if (visible === text) continue;
+          }
+          if (!useHistory) log.info(`card history recovery session=${sessionId} card=${messageId}`);
+          useHistory = true;
+          if (previousText !== text) {
+            previousText = text;
+            if (text) replaceStoredText(reply.paragraphs);
+          }
+          if (reply.error) state = reduce(state, { type: "error", message: reply.error });
+          if (reply.error || reply.done) return;
+        } catch (err) {
+          if (!warned && !history.signal.aborted) log.warn(`card history lookup failed for ${sessionId}: ${(err as Error).message}`);
+          warned = true;
+        }
+      }
+    };
     try {
-      await stream.start();
+      try {
+        await stream.start();
+      } catch (err) {
+        abortSignal?.throwIfAborted();
+        log.warn(`card event subscription failed for ${sessionId}: ${(err as Error).message}`);
+      }
+      abortSignal?.throwIfAborted();
       await this.client.promptAsync({
         sessionId,
+        messageID: parentID,
+        directory,
         parts,
         agent: rt.agent,
         model: rt.model,
         tools: PROMPT_TOOLS,
         signal: abortSignal,
       });
-      await completion;
-      // completion resolves either via done event OR via stream.close() (abort path).
-      // Check the abort signal to distinguish the two.
+      await Promise.race([completion, monitorHistory()]);
+      history.abort();
+      // An idle event can arrive even when no assistant text deltas were delivered.
+      if (!abortSignal?.aborted && !useHistory && !state.blocks.some(b => b.kind === "text")) {
+        try {
+          const reply = await readReply(abortSignal);
+          if (reply?.paragraphs.length) {
+            useHistory = true;
+            replaceStoredText(reply.paragraphs);
+          }
+          if (reply?.error) state = reduce(state, { type: "error", message: reply.error });
+        } catch (err) {
+          log.warn(`final card history lookup failed for ${sessionId}: ${(err as Error).message}`);
+        }
+      }
       if (abortSignal?.aborted) {
         state = markInterrupted(state);
       } else {
@@ -1466,6 +1549,7 @@ export class Bridge {
         state = reduce(state, { type: "error", message: msg });
       }
     } finally {
+      history.abort();
       rt.abort?.signal.removeEventListener("abort", abortListener);
       rt.abort = undefined;
       clearInterval(patcher);
@@ -1481,7 +1565,7 @@ export class Bridge {
       log.info(`stop button pressed for chat=${chatId}`);
       rt.abort.abort();
       const sessionId = this.sessions.getSession(chatId);
-      if (sessionId) void this.client.abortSession(sessionId).catch(() => undefined);
+      if (sessionId) void this.client.abortSession(sessionId, this.cardDirectory(chatId)).catch(() => undefined);
     }
   }
 
